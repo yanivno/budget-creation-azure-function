@@ -1,19 +1,21 @@
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from venv import logger
+import slack as slack_integration
 import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.consumption import ConsumptionManagementClient
-#from azure.developer.devcenter import DevCenterClient
 from azure.core.exceptions import AzureError
+
 
 # Set the logging policy to default to 'none' (NOTSET)
 logging.basicConfig(level=logging.WARNING)
 
 app = func.FunctionApp()
 
-@app.schedule(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=True, use_monitor=False) 
+@app.schedule(schedule="* * * * * *", arg_name="myTimer", run_on_startup=True, use_monitor=False) 
 def timer_trigger(myTimer: func.TimerRequest) -> None:
     if myTimer.past_due:
         logging.warning('The timer is past due!')
@@ -26,11 +28,8 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
         resource_group_created_by_tag = get_env_variable('AZURE_RESOURCE_GROUP_CREATED_BY_TAG')
         budget_amount = float(get_env_variable('AZURE_BUDGET_AMOUNT'))
         default_mail = get_env_variable('AZURE_DEFAULT_MAIL')
+        alert_threshold_percentage = float(get_env_variable('ALERT_THRESHOLD_PERCENTAGE'))
 
-        #new variables for ADE
-        #devcenter_name = get_env_variable('AZURE_DEV_CENTER_NAME')
-        #devcenter_project_name = get_env_variable('AZURE_DEV_CENTER_PROJECT_NAME')
-        #devcenter_endpoint = get_env_variable('AZURE_DEV_CENTER_ENDPOINT')
 
         # Initialize Azure credentials
         credential = DefaultAzureCredential()
@@ -67,6 +66,7 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
         # Get budgets with matching names
         matching_budgets = []
         created_budgets = []
+        budgets_exceeding_threshold = []  # Budgets with >80% consumption for Slack notifications
 
         # Search for budgets at resource group scope
         for rg in resource_groups:
@@ -79,16 +79,32 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
                 for budget in rg_budgets:
                     if budget_name_filter.lower() in budget.name.lower():
                         found_budget = True
-                        matching_budgets.append({
+                        
+                        # Calculate consumption percentage
+                        current_spend = budget.current_spend.amount if budget.current_spend else 0
+                        consumption_percentage = (current_spend / budget.amount * 100) if budget.amount > 0 else 0
+                        
+                        budget_info = {
                             'name': budget.name,
                             'amount': budget.amount,
+                            'current_spend': current_spend,
+                            'consumption_percentage': round(consumption_percentage, 2),
                             'time_grain': budget.time_grain,
                             'category': budget.category,
                             'scope': rg['id'],
-                            'resource_group': rg['name']
-                        })
-                        logging.warning(f'Found existing budget in dev environment {rg["name"]}: {budget.name}')
-                
+                            'resource_group': rg['name'],
+                            'owner': rg.get('owner', default_mail)
+                        }
+                        matching_budgets.append(budget_info)
+                        logging.warning(f'Found existing budget in dev environment {rg["name"]}: {budget.name} - Consumption: {consumption_percentage:.2f}%')
+                        
+                        # Check if budget exceeds threshold
+                        if consumption_percentage >= alert_threshold_percentage:
+                            budgets_exceeding_threshold.append(budget_info)
+                            logging.warning(f'⚠️ Budget {budget.name} exceeds {alert_threshold_percentage}% threshold: {consumption_percentage:.2f}% consumed')
+
+                        
+                # create a new budget if not found
                 if not found_budget:
                     owner_email = rg['owner'] if 'owner' in rg else default_mail
 
@@ -107,23 +123,50 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
 
         logging.warning(f'Total existing budgets found: {len(matching_budgets)}')
         logging.warning(f'Total created budgets: {len(created_budgets)}')
+        logging.warning(f'Budgets exceeding {alert_threshold_percentage}% threshold: {len(budgets_exceeding_threshold)}')
         
         # Log summary
         logging.warning('=== SUMMARY ===')
         logging.warning(f'Resource Groups: {len(resource_groups)}')
         logging.warning(f'Existing Budgets: {len(matching_budgets)}')
+        logging.warning(f'Budgets Exceeding {alert_threshold_percentage}%: {len(budgets_exceeding_threshold)}')
         
         if matching_budgets:
             logging.warning('Budget Details:')
             for budget in matching_budgets:
-                logging.warning(f'  - {budget["name"]}: {budget["amount"]} ({budget.get("resource_group", "subscription level")})')
+                logging.warning(f'  - {budget["name"]}: ${budget["current_spend"]:.2f}/${budget["amount"]} ({budget["consumption_percentage"]}%) - {budget.get("resource_group", "subscription level")}')
         
+        # Budgets exceeding threshold - ready for Slack notification
+        if budgets_exceeding_threshold:
+            logging.warning('=== BUDGETS EXCEEDING <>% (For Slack Notification) ===')
+            for budget in budgets_exceeding_threshold:
+                logging.warning(f'  🚨 {budget["name"]}: ${budget["current_spend"]:.2f}/${budget["amount"]} ({budget["consumption_percentage"]}%) - Owner: {budget["owner"]}')
+            
+            # TODO: Send Slack notification with budgets_exceeding_threshold
+            # send_slack_notification(budgets_exceeding_threshold)
+            for budget in budgets_exceeding_threshold:
+                slack_user_id = slack_integration.get_user_by_email(budget['owner'])
+                if not slack_user_id:
+                    logging.warning(f"Could not find Slack user ID for email: {budget['owner']}. Skipping Slack notification.")
+                    continue
+
+                message = slack_integration.format_slack_message(
+                    user_name=budget['owner'], 
+                    env_name=budget.get('resource_group'),
+                    subscription_id=subscription_id,
+                    budget_details=budget
+                )
+
+                slack_integration.send_slack_message(slack_user_id, message)
+                slack_integration.send_message_to_webhook(message)
+
 
     except Exception as e:
         logging.error(f'Error in timer_trigger function: {str(e)}')
         raise
 
     logging.warning('Python timer trigger function executed successfully.')
+
 
 
 def create_budget_for_resource_group(consumption_client, rg_id, budget_name, amount, 
@@ -145,6 +188,7 @@ def create_budget_for_resource_group(consumption_client, rg_id, budget_name, amo
     
     # Prepare contact emails list - include owner email if available
     contact_emails = []
+
     if owner_email:
         contact_emails.append(owner_email)
         logging.warning(f'Adding owner email to budget notifications: {owner_email}')
@@ -189,6 +233,7 @@ def create_budget_for_resource_group(consumption_client, rg_id, budget_name, amo
             },
         }
     }
+    
     try:
         budget = consumption_client.budgets.create_or_update(
             scope=scope,
