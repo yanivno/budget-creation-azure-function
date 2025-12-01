@@ -29,6 +29,7 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
         budget_amount = float(get_env_variable('AZURE_BUDGET_AMOUNT'))
         default_mail = get_env_variable('AZURE_DEFAULT_MAIL')
         alert_threshold_percentage = float(get_env_variable('ALERT_THRESHOLD_PERCENTAGE'))
+        slack_channel_id = get_env_variable('SLACK_CHANNEL_ID')
 
 
         # Initialize Azure credentials
@@ -158,7 +159,7 @@ def timer_trigger(myTimer: func.TimerRequest) -> None:
                 )
 
                 slack_integration.send_slack_message(slack_user_id, message)
-                slack_integration.send_message_to_webhook(message)
+                slack_integration.send_slack_message(slack_channel_id,message)
 
 
     except Exception as e:
