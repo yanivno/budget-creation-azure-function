@@ -9,3 +9,4 @@ azure-mgmt-resource
 azure-mgmt-consumption
 azure-mgmt-devcenter
 azure-core
+urllib3
